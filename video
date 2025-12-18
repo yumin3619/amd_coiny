@@ -1,0 +1,2026 @@
+import os
+import sys
+import math
+import subprocess
+from enum import Enum
+
+
+from PySide6 import QtCore, QtWidgets, QtGui
+
+# =========================================================
+# 사용자 환경 설정 (이전 설정값 유지)
+# =========================================================
+MPV_DLL_DIR = r"D:\mpv-dev-2"   # libmpv-2.dll 있는 폴더. 이미 PATH면 ""로 둬도 됨.
+
+VIDEO_OUTPUT_LEVELS = "full"    # "full" 또는 "limited"
+FORCE_TONEMAP = False
+TARGET_PEAK_NITS = "1000"       # 800~1000 정도로 테스트
+
+DEFAULT_BRIGHTNESS = 0          #밝기 초기값
+DEFAULT_CONTRAST = 0            #대비 초기값
+DEFAULT_GAMMA = 0               #감마 초기값
+
+TIME_SEEK_STEP_SEC = 1.0        # 시간 모드: ←/→ 한 번에 이동(초)
+FRAME_SEEK_STEP = 1             # 프레임 모드: 항상 1프레임 (고정)
+PAN_DRAG_SENS = 1               # 우클릭 드래그 화면 이동 감도
+
+ZOOM_STEP_BASE = 1.1            # 휠 1틱당 줌 배율
+ZOOM_MIN = 0.2
+ZOOM_MAX = 8.0
+
+COLOR_RANGE = 20.0              # -20 ~ +20
+COLOR_STEP_FINE = 0.2           # 미세 조정 단위(슬라이더/+- 버튼 공통)
+TICK_INTERVAL_MS = 100          # 틱 타이머 간격
+
+# Step3 품질 정책 (이전 설정값 유지)
+SCALE_LUMA = "ewa_lanczos"
+SCALE_CHROMA = "ewa_lanczos"
+DSCALE_KERNEL = "mitchell"
+LINEAR_DOWNSCALING = True
+SIGMOID_UPSCALING = True
+SCALE_ANTIRING = 0.8
+CSCALE_ANTIRING = 0.8
+DITHER_DEPTH = 10
+DITHER_METHOD = "fruit"
+TEMPORAL_DITHER = True
+ZOOM_THROTTLE_MS = 30
+PAN_THROTTLE_MS = 16
+# =========================================================
+
+if MPV_DLL_DIR and os.path.isdir(MPV_DLL_DIR):
+    os.environ["PATH"] = MPV_DLL_DIR + os.pathsep + os.environ.get("PATH", "")
+
+try:
+    import mpv
+except Exception as e:
+    raise RuntimeError(
+        "python-mpv 모듈이 없습니다.\n"
+        "설치: python -m pip install python-mpv\n"
+        f"원인: {e}"
+    )
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+def fmt_time(sec: float | None) -> str:
+    if sec is None:
+        return "--:--"
+    sec = max(0.0, float(sec))
+    m = int(sec // 60)
+    s = int(sec % 60)
+    return f"{m:02d}:{s:02d}"
+
+class MoveMode(Enum):
+    TIME = 0
+    FRAME = 1
+
+# =========================================================
+# ROI Overlay (TOP-LEVEL, TRANSPARENT)
+# =========================================================
+class RoiOverlayWindow(QtWidgets.QWidget):
+    def __init__(self, main_window: QtWidgets.QMainWindow):
+        super().__init__(main_window)
+        self._mw = main_window
+
+        self.setWindowFlags(
+            QtCore.Qt.Tool
+            | QtCore.Qt.FramelessWindowHint
+                        | QtCore.Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+
+        self._pen = QtGui.QPen(QtGui.QColor(255, 0, 0), 2)
+
+    def sync_to_video(self):
+        mw = self._mw
+        video = getattr(mw, "video", None)
+
+        # overlay 강제 숨김 상태(전체화면 전환 등) / 앱 비활성 상태
+        if getattr(mw, "_roi_overlay_suspended", False) or getattr(mw, "_roi_overlay_app_inactive", False):
+            if self.isVisible():
+                self.hide()
+            return
+
+        if video is None:
+            if self.isVisible():
+                self.hide()
+            return
+
+        app = QtWidgets.QApplication.instance()
+        app_active = True
+        try:
+            app_active = (app is not None) and (app.applicationState() == QtCore.Qt.ApplicationActive)
+        except Exception:
+            app_active = True
+        # ROI overlay는 MainWindow에서 계산된 표시용 _roi_rect를 그대로 사용
+        r = getattr(mw, "_roi_rect", None)
+        if r is None:
+            if self.isVisible():
+                self.hide()
+            return
+
+        # ⚠️ 성능: ROI 이동/드래그 중에는 geometry가 대부분 변하지 않음.
+        # 매번 setGeometry/raise_ 를 호출하면 이벤트 폭주로 끊김이 생길 수 있어
+        # '필요할 때만' geometry를 갱신하고, 그 외에는 update()만 수행한다.
+        top_left = video.mapToGlobal(QtCore.QPoint(0, 0))
+        w = int(video.width())
+        h = int(video.height())
+
+        desired = QtCore.QRect(int(top_left.x()), int(top_left.y()), w, h)
+        if self.geometry() != desired:
+            self.setGeometry(desired)
+            # geometry가 변한 경우만 앞으로
+            if app_active and mw.isActiveWindow():
+                self.raise_()
+
+        if not self.isVisible():
+            self.show()
+            if app_active and mw.isActiveWindow():
+                self.raise_()
+
+        # ROI만 바뀌는 경우: repaint만
+        self.update()
+
+    def paintEvent(self, e: QtGui.QPaintEvent):
+        mw = self._mw
+        r = getattr(mw, "_roi_rect", None)
+        if not r:
+            return
+
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_Source)
+        p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 0))
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+
+        p.setPen(self._pen)
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawRect(r.adjusted(1, 1, -1, -1))
+
+
+# =========================================================
+# ROI 크기 입력 다이얼로그
+# =========================================================
+class RoiCreateDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ROI 생성")
+        self.setModal(True)
+
+        self._w = QtWidgets.QSpinBox(self)
+        self._h = QtWidgets.QSpinBox(self)
+        self._w.setRange(10, 2000)
+        self._h.setRange(10, 2000)
+        self._w.setValue(300)
+        self._h.setValue(200)
+
+        btn_ok = QtWidgets.QPushButton("생성", self)
+        btn_cancel = QtWidgets.QPushButton("취소", self)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("너비 (W):", self._w)
+        form.addRow("높이 (H):", self._h)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(btn_ok)
+        row.addWidget(btn_cancel)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.addLayout(form)
+        root.addLayout(row)
+
+        self.setFixedSize(self.sizeHint())
+
+    def get_size(self) -> tuple[int, int]:
+        return int(self._w.value()), int(self._h.value())
+
+# =========================================================
+# MPV 비디오 위젯
+# =========================================================
+class MpvVideoWidget(QtWidgets.QWidget):
+    zoomChanged = QtCore.Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setMouseTracking(True)
+        self.setAttribute(QtCore.Qt.WA_NativeWindow, True)
+        self.setAttribute(QtCore.Qt.WA_DontCreateNativeAncestors, True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+        self._mpv = None
+
+        # 줌/팬
+        self.zoom_min = ZOOM_MIN
+        self.zoom_max = ZOOM_MAX
+        self.zoom_factor = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+
+        # 팬 드래그
+        self._panning = False
+        self._last_pos = QtCore.QPointF(0, 0)
+
+        # 내부 보정값
+        self._brightness = int(DEFAULT_BRIGHTNESS)
+        self._contrast = int(DEFAULT_CONTRAST)
+        self._gamma = int(DEFAULT_GAMMA)
+
+        # 이동 모드
+        self.move_mode = MoveMode.TIME
+
+        # wheel zoom burst 완화(누적 후 1프레임 단위 적용)
+        self._zoom_flush_timer = QtCore.QTimer(self)
+        self._zoom_flush_timer.setSingleShot(True)
+        self._zoom_flush_timer.setInterval(ZOOM_THROTTLE_MS)
+        self._zoom_flush_timer.timeout.connect(self._flush_pending_zoom)
+
+        self._pending_zoom = None
+
+        # pan drag burst 완화(누적 후 일정 주기로 적용)
+        self._pan_flush_timer = QtCore.QTimer(self)
+        self._pan_flush_timer.setSingleShot(True)
+        self._pan_flush_timer.setInterval(PAN_THROTTLE_MS)
+        self._pan_flush_timer.timeout.connect(self._flush_pending_pan)
+        self._pan_dirty = False
+
+        self._pending_zoom = None
+        self._pending_anchor = None
+        self._wheel_accum = 0  # angleDelta 누적(120=1틱)
+
+    def _zoom_to_video_zoom(self, z: float) -> float:
+        z = max(0.01, float(z))
+        return math.log(z, 2)
+
+    def _ensure_mpv(self):
+        if self._mpv is not None:
+            return
+
+        self._mpv = mpv.MPV(
+            wid=str(int(self.winId())),
+            vo="gpu-next",
+            gpu_api="d3d11",
+            hwdec="auto-safe",
+            keep_open="yes",
+
+            scale=SCALE_LUMA,
+            cscale=SCALE_CHROMA,
+            dscale=DSCALE_KERNEL,
+
+            correct_downscaling="yes",
+            linear_downscaling="yes" if LINEAR_DOWNSCALING else "no",
+            sigmoid_upscaling="yes" if SIGMOID_UPSCALING else "no",
+
+            scale_antiring=float(SCALE_ANTIRING),
+            cscale_antiring=float(CSCALE_ANTIRING),
+
+            target_colorspace_hint="yes",
+            d3d11_output_format="rgb10_a2",
+            dither_depth=int(DITHER_DEPTH),
+            dither=DITHER_METHOD,
+            temporal_dither="yes" if TEMPORAL_DITHER else "no",
+
+            video_output_levels=VIDEO_OUTPUT_LEVELS,
+        )
+
+        if FORCE_TONEMAP:
+            self._mpv["tone-mapping"] = "hable"
+            self._mpv["target-peak"] = TARGET_PEAK_NITS
+
+        self._apply_color_controls()
+        self._apply_view()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._ensure_mpv()
+
+    # --- 색상 제어 ---
+    def _apply_color_controls(self):
+        if not self._mpv: return
+        self._mpv["brightness"] = int(self._brightness)
+        self._mpv["contrast"] = int(self._contrast)
+        self._mpv["gamma"] = int(self._gamma)
+
+    def set_brightness(self, v: float):
+        self._brightness = v
+        if not self._mpv: return
+        self._mpv.brightness = float(v)
+        if self._mpv.pause: self._mpv.command("seek", "0", "relative", "exact")
+
+    def set_contrast(self, v: float):
+        self._contrast = v
+        if not self._mpv: return
+        self._mpv.contrast = float(v)
+        if self._mpv.pause: self._mpv.command("seek", "0", "relative", "exact")
+
+    def set_gamma(self, v: float):
+        self._gamma = v
+        if not self._mpv: return
+        self._mpv.gamma = float(v)
+        if self._mpv.pause: self._mpv.command("seek", "0", "relative", "exact")
+    # -----------------
+
+    # --- MPV 제어 ---
+    def load(self, path: str):
+        self._ensure_mpv()
+        self.reset_view()
+        self._mpv.pause = True
+        self._mpv.command("loadfile", path, "replace")
+        self._mpv.pause = True
+        self._apply_color_controls()
+
+    def toggle_pause(self):
+        self._ensure_mpv()
+        self._mpv.pause = not bool(self._mpv.pause)
+
+    def stop(self):
+        if self._mpv: self._mpv.command("stop")
+
+    def set_volume(self, v: int):
+        self._ensure_mpv()
+        self._mpv.volume = int(v)
+
+    def duration(self):
+        if not self._mpv: return None
+        try: return float(self._mpv.duration)
+        except Exception: return None
+
+    def time_pos(self):
+        if not self._mpv: return None
+        try: return float(self._mpv.time_pos)
+        except Exception: return None
+
+    def seek_abs(self, sec: float):
+        self._ensure_mpv()
+        self._mpv.command("seek", str(float(sec)), "absolute", "exact")
+
+    def step_time_left(self):
+        self._ensure_mpv()
+        self._mpv.command("seek", str(-TIME_SEEK_STEP_SEC), "relative", "exact")
+        self._mpv.pause = True
+
+    def step_time_right(self):
+        self._ensure_mpv()
+        self._mpv.command("seek", str(TIME_SEEK_STEP_SEC), "relative", "exact")
+        self._mpv.pause = False
+
+    def step_frame_left(self):
+        self._ensure_mpv()
+        self._mpv.pause = True
+        self._mpv.command("frame-back-step")
+
+    def step_frame_right(self):
+        self._ensure_mpv()
+        self._mpv.pause = True
+        self._mpv.command("frame-step")
+
+    def step_left(self): self.step_time_left()
+    def step_right(self): self.step_time_right()
+
+    def _apply_view(self):
+        if not self._mpv: return
+        self.zoom_factor = clamp(self.zoom_factor, self.zoom_min, self.zoom_max)
+        self._mpv["video-zoom"] = self._zoom_to_video_zoom(self.zoom_factor)
+        self.pan_x = clamp(self.pan_x, -1.0, 1.0)
+        self.pan_y = clamp(self.pan_y, -1.0, 1.0)
+        self._mpv["video-pan-x"] = self.pan_x
+        self._mpv["video-pan-y"] = self.pan_y
+        self.zoomChanged.emit(self.zoom_factor)
+
+    def reset_view(self):
+        self.zoom_factor = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._apply_view()
+
+    def _set_zoom(self, z: float, anchor: QtCore.QPointF | None = None):
+        old_z = float(self.zoom_factor)
+        new_z = float(clamp(z, self.zoom_min, self.zoom_max))
+        if anchor is not None and old_z > 0.0 and new_z != old_z:
+            w = max(1.0, float(self.width()))
+            h = max(1.0, float(self.height()))
+            sx = (float(anchor.x()) - w * 0.5) / (w * 0.5)
+            sy = (float(anchor.y()) - h * 0.5) / (h * 0.5)
+            r = new_z / old_z
+            self.pan_x = r * float(self.pan_x) + (1.0 - r) * sx
+            self.pan_y = r * float(self.pan_y) + (1.0 - r) * sy
+
+        self.zoom_factor = new_z
+        self._apply_view()
+
+    def wheelEvent(self, e):
+        dy = e.angleDelta().y()
+        if dy == 0: return
+
+        self._wheel_accum += int(dy)
+
+        TICK = 120
+        steps = self._wheel_accum // TICK
+        if steps == 0:
+            e.accept()
+            return
+
+        self._wheel_accum -= steps * TICK
+
+        base_step = ZOOM_STEP_BASE
+        factor = (base_step ** steps) if steps > 0 else ((1.0 / base_step) ** (-steps))
+        target_zoom = self.zoom_factor * factor
+        anchor = e.position()
+
+        self._pending_zoom = float(target_zoom)
+        self._pending_anchor = anchor
+
+        if not self._zoom_flush_timer.isActive():
+            self._zoom_flush_timer.start()
+
+        e.accept()
+
+    def mousePressEvent(self, e):
+        if e.button() == QtCore.Qt.RightButton:
+            self._panning = True
+            self._last_pos = e.position()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._panning and self._mpv:
+            pos = e.position()
+            delta = pos - self._last_pos
+            self._last_pos = pos
+
+            w = max(1, self.width())
+            h = max(1, self.height())
+
+            self.pan_x += float(delta.x()) / float(w) * PAN_DRAG_SENS
+            self.pan_y += float(delta.y()) / float(h) * PAN_DRAG_SENS
+
+            self._pan_dirty = True
+            if not self._pan_flush_timer.isActive():
+                self._pan_flush_timer.start()
+            e.accept()
+            return
+
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == QtCore.Qt.RightButton:
+            self._panning = False
+            if self._pan_flush_timer.isActive():
+                self._pan_flush_timer.stop()
+            self._flush_pending_pan()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        self.reset_view()
+        super().mouseDoubleClickEvent(e)
+
+    def _flush_pending_pan(self):
+        if not self._pan_dirty:
+            return
+        self._pan_dirty = False
+        self._apply_view()
+
+    def _flush_pending_zoom(self):
+        if self._pending_zoom is None: return
+        z = float(self._pending_zoom)
+        a = self._pending_anchor
+        self._pending_zoom = None
+        self._pending_anchor = None
+        self._set_zoom(z, a)
+
+    def toggle_move_mode(self):
+        if self.move_mode == MoveMode.TIME: self.set_move_mode(MoveMode.FRAME)
+        else: self.set_move_mode(MoveMode.TIME)
+
+    def is_paused(self) -> bool:
+        if not getattr(self, "_mpv", None): return True
+        try: return bool(self._mpv.pause)
+        except Exception: return True
+
+    def set_ab_loop(self, a_sec: float, b_sec: float):
+        self._ensure_mpv()
+        self._mpv["ab-loop-a"] = float(a_sec)
+        self._mpv["ab-loop-b"] = float(b_sec)
+
+    def clear_ab_loop(self):
+        if not getattr(self, "_mpv", None): return
+        try:
+            self._mpv["ab-loop-a"] = "no"
+            self._mpv["ab-loop-b"] = "no"
+        except Exception:
+            try:
+                self._mpv["ab-loop-a"] = None
+                self._mpv["ab-loop-b"] = None
+            except Exception:
+                pass
+
+    def eof_reached(self) -> bool:
+        if not self._mpv: return False
+        try: return bool(self._mpv["eof-reached"])
+        except Exception:
+            try: return bool(getattr(self._mpv, "eof_reached"))
+            except Exception: return False
+
+    def seek(self, sec: float):
+        self._ensure_mpv()
+        self._mpv.command("seek", str(float(sec)), "absolute", "exact")
+
+# =========================================================
+# 색상 제어 다이얼로그
+# =========================================================
+class ColorControlDialog(QtWidgets.QDialog):
+    def __init__(self, video: "MpvVideoWidget", parent=None):
+        super().__init__(parent)
+        self.video = video
+
+        self.setWindowTitle("Color Controls (F4)")
+        self.setWindowModality(QtCore.Qt.NonModal)
+        self.setMinimumWidth(580)
+        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
+
+        self._scale = int(round(1.0 / COLOR_STEP_FINE))
+        self._vmin = int(round(-COLOR_RANGE * self._scale))
+        self._vmax = int(round(COLOR_RANGE * self._scale))
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        root.addLayout(grid)
+
+        def to_int(v: float) -> int: return int(round(float(v) * self._scale))
+        def to_float(i: int) -> float: return float(i) / float(self._scale)
+
+        def add_row(row: int, name: str, getter, setter):
+            lbl = QtWidgets.QLabel(name)
+            btn_minus = QtWidgets.QPushButton("-")
+            btn_minus.setFixedWidth(32)
+            sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            sld.setRange(self._vmin, self._vmax)
+            btn_plus = QtWidgets.QPushButton("+")
+            btn_plus.setFixedWidth(32)
+            val = QtWidgets.QLabel("0.0")
+            val.setFixedWidth(60)
+            val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            btn_reset = QtWidgets.QPushButton("초기화")
+            btn_reset.setFixedWidth(70)
+
+            grid.addWidget(lbl, row, 0)
+            grid.addWidget(btn_minus, row, 1)
+            grid.addWidget(sld, row, 2)
+            grid.addWidget(btn_plus, row, 3)
+            grid.addWidget(val, row, 4)
+            grid.addWidget(btn_reset, row, 5)
+
+            def apply_i(i: int):
+                f = to_float(i)
+                val.setText(f"{f:.1f}")
+                setter(f)
+
+            def step_by(sign: int):
+                cur = int(sld.value())
+                nxt = max(self._vmin, min(self._vmax, cur + sign * 1))
+                if nxt != cur: sld.setValue(nxt)
+
+            sld.valueChanged.connect(lambda i: apply_i(int(i)))
+            btn_plus.clicked.connect(lambda: step_by(+1))
+            btn_minus.clicked.connect(lambda: step_by(-1))
+            btn_reset.clicked.connect(lambda: sld.setValue(0))
+
+            return (sld, val, getter, to_int)
+
+        self._rows = {}
+        self._rows["bri"] = add_row(0, "밝기", getter=lambda: float(getattr(self.video, "_brightness", 0.0)), setter=self.video.set_brightness)
+        self._rows["con"] = add_row(1, "대비", getter=lambda: float(getattr(self.video, "_contrast", 0.0)), setter=self.video.set_contrast)
+        self._rows["gam"] = add_row(2, "감마", getter=lambda: float(getattr(self.video, "_gamma", 0.0)), setter=self.video.set_gamma)
+        self.sync_from_video()
+
+    def sync_from_video(self):
+        for _, (sld, val, getter, to_int) in self._rows.items():
+            f = float(getter())
+            i = max(self._vmin, min(self._vmax, to_int(f)))
+            b = sld.blockSignals(True)
+            sld.setValue(i)
+            sld.blockSignals(b)
+            val.setText(f"{(float(i) / float(self._scale)):.1f}")
+
+# =========================================================
+# 메인 윈도우
+# =========================================================
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Qt + libmpv")
+        self.resize(1280, 720)
+
+        self.color_dlg = None
+
+        # loop state
+        self.loop_start = None
+        self.loop_end = None
+        self._last_zoom = 1.0
+
+        self._ab_last = None  # (start,end) 마지막 적용값
+        # --- ROI state ---
+        # ROI는 원본(src) 좌표로 유지하고, 화면 표시(widget)는 투영값으로만 사용
+        self._roi_src_rect = None  # QtCore.QRect (src pixels)
+        self._roi_rect = None      # QtCore.QRect (widget pixels)
+        self._roi_drag = False
+        self._roi_drag_last = None  # QtCore.QPoint (widget)
+        self._roi_dragging = False
+        # ROI overlay sync throttle
+        self._roi_sync_pending = False
+        self._roi_sync_delay = 16
+        if getattr(self, "_roi_overlay_suspended", False) or getattr(self, "_roi_overlay_app_inactive", False):
+            try:
+                self.roi_overlay.hide()
+            except Exception:
+                pass
+            return
+
+
+        # overlay 제어(전체화면 등에서 강제 숨김)
+        self._roi_overlay_suspended = False
+        self._roi_overlay_app_inactive = False
+        # -----------------
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        self.video = MpvVideoWidget()
+        root.addWidget(self.video, 1)
+
+        # ROI Overlay (Top-level Window)
+        self.roi_overlay = RoiOverlayWindow(self)
+
+        # top bar
+        bar_top = QtWidgets.QHBoxLayout()
+        bar_top.setSpacing(8)
+        root.addLayout(bar_top)
+
+        self.btn_open = QtWidgets.QPushButton("파일 열기")
+        self.btn_pause = QtWidgets.QPushButton("재생/일시정지")
+        self.btn_stop = QtWidgets.QPushButton("정지")
+
+        self.lbl_zoom = QtWidgets.QLabel("Zoom: 1.00x")
+        self.chk_loop = QtWidgets.QCheckBox()
+        self.lbl_loop_range = QtWidgets.QLabel("(--:-- / --:--)")
+
+        self.slider_vol = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_vol.setRange(0, 100)
+        self.slider_vol.setValue(50)
+        self.slider_vol.setFixedWidth(120)
+
+        bar_top.addWidget(self.btn_open)
+        bar_top.addWidget(self.btn_pause)
+        bar_top.addWidget(self.btn_stop)
+        bar_top.addSpacing(10)
+        bar_top.addWidget(self.lbl_zoom)
+        bar_top.addWidget(self.chk_loop)
+        bar_top.addWidget(self.lbl_loop_range)
+        bar_top.addStretch(1)
+
+        self.btn_crop = QtWidgets.QPushButton("✂")
+        self.btn_crop.setFixedWidth(32)
+        self.btn_crop.clicked.connect(self._crop_by_roi)
+        bar_top.addWidget(self.btn_crop)
+
+        bar_top.addWidget(QtWidgets.QLabel("볼륨"))
+        bar_top.addWidget(self.slider_vol)
+
+        # seek bar
+        bar_seek = QtWidgets.QHBoxLayout()
+        root.addLayout(bar_seek)
+
+        self.slider_pos = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_pos.setRange(0, 1000)
+
+        self.lbl_time = QtWidgets.QLabel("00:00 / 00:00")
+        self.lbl_time.setMinimumWidth(120)
+
+        # [ADD] ROI 크기 표시(원본 기준)
+        self.lbl_roi = QtWidgets.QLabel("ROI: -- x --")
+        self.lbl_roi.setMinimumWidth(120)
+
+        # [ADD] 저장 / 초기화 버튼
+        self.btn_save_roi = QtWidgets.QPushButton("저장")
+        self.btn_save_roi.setFixedWidth(60)
+        self.btn_save_roi.clicked.connect(self._crop_by_roi)
+
+        self.btn_reset_times = QtWidgets.QPushButton("초기화")
+        self.btn_reset_times.setFixedWidth(60)
+        self.btn_reset_times.clicked.connect(lambda: (self._reset_loop_points(), self._update_loop_ui()))
+
+        bar_seek.addWidget(self.slider_pos, 1)
+        bar_seek.addWidget(self.lbl_time)
+        bar_seek.addSpacing(8)
+        bar_seek.addWidget(self.lbl_roi)
+        bar_seek.addSpacing(8)
+        bar_seek.addWidget(self.btn_save_roi)
+        bar_seek.addWidget(self.btn_reset_times)
+
+        # signals
+        self.btn_open.clicked.connect(self.open_file)
+        self.btn_pause.clicked.connect(self._toggle_pause_and_sync)
+        self.btn_stop.clicked.connect(self.video.stop)
+
+        self.chk_loop.toggled.connect(lambda _: self._sync_ab_loop())
+        self.slider_vol.valueChanged.connect(lambda v: self.video.set_volume(int(v)))
+        self.video.zoomChanged.connect(self._on_zoom_changed)
+
+        # seeking flag
+        self._seeking = False
+        self.slider_pos.sliderPressed.connect(lambda: setattr(self, "_seeking", True))
+        self.slider_pos.sliderReleased.connect(self._seek_release)
+
+        # time nav (←/→)
+        self._nav_dir = 0
+        self._nav_pressed = False
+        self._nav_hold = False
+        self._nav_hold_timer = QtCore.QTimer(self)
+        self._nav_hold_timer.setSingleShot(True)
+        self._nav_hold_timer.setInterval(180)
+        self._nav_hold_timer.timeout.connect(self._on_nav_hold_start)
+        self._nav_repeat_timer = QtCore.QTimer(self)
+        self._nav_repeat_timer.setInterval(60)
+        self._nav_repeat_timer.timeout.connect(self._on_nav_repeat)
+
+        # frame nav (A/D)
+        self._fnav_dir = 0
+        self._fnav_pressed = False
+        self._fnav_hold = False
+        self._fnav_hold_timer = QtCore.QTimer(self)
+        self._fnav_hold_timer.setSingleShot(True)
+        self._fnav_hold_timer.setInterval(180)
+        self._fnav_hold_timer.timeout.connect(self._on_fnav_hold_start)
+        self._fnav_repeat_timer = QtCore.QTimer(self)
+        self._fnav_repeat_timer.setInterval(60)
+        self._fnav_repeat_timer.timeout.connect(self._on_fnav_repeat)
+
+        # tick
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(TICK_INTERVAL_MS)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start()
+
+        self._pseudo_fs_on = False
+        self._pseudo_saved = {}
+
+        self._update_loop_ui()
+        self._update_roi_ui()  # [ADD] 초기 1회
+
+        # ✅ 이벤트 필터: QApplication + video 위젯 둘 다
+        app = QtWidgets.QApplication.instance()
+        if app:
+            app.installEventFilter(self)
+        self.video.installEventFilter(self)
+
+        # 초기 1회만 위치 맞춤
+        self._roi_sync_request(0)
+
+
+
+    def open_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "비디오 파일 열기",
+            "",
+            "Video Files (*.mp4 *.mkv *.webm *.mov *.avi *.m4v);;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        self._current_path = path  # ✅ 현재 입력 파일 경로 저장
+        self.video.load(path)
+        self._reset_loop_points()
+
+    def _seek_release(self):
+        self._seeking = False
+
+        d = self.video.duration()
+        if not d: return
+
+        frac = self.slider_pos.value() / 1000.0
+        t = frac * float(d)
+        self.video.seek_abs(t)
+
+    def _tick(self):
+        if getattr(self, "_seeking", False):
+            return
+
+        d = self.video.duration()
+        t = self.video.time_pos()
+        if not d or t is None:
+            t = 0.0
+
+        if d and d > 0:
+            frac = clamp(t / d, 0.0, 1.0)
+            self.slider_pos.setValue(int(frac * 1000))
+
+        self.lbl_time.setText(f"{fmt_time(t)} / {fmt_time(d)}")
+
+        # [ADD] ROI 표시 갱신(원본 기준 w x h)
+        self._update_roi_ui()
+
+        # ✅ 반복 재생 유지(기존 동작 복구)
+        self._sync_ab_loop()
+
+
+    def _loop_valid(self) -> bool:
+        if getattr(self, "loop_start", None) is None or getattr(self, "loop_end", None) is None:
+            return False
+        return float(self.loop_start) <= float(self.loop_end)
+
+
+    # =========================================================
+    # ROI overlay sync throttling (성능 개선)
+    # =========================================================
+    def _roi_sync_request(self, delay_ms: int = 16):
+        """ROI overlay 갱신 요청을 coalesce 해서 과도한 move/resize/repaint를 방지."""
+        if getattr(self, "_roi_overlay_suspended", False) or getattr(self, "_roi_overlay_app_inactive", False):
+            return
+        if not hasattr(self, "_roi_sync_pending"):
+            self._roi_sync_pending = False
+            self._roi_sync_delay = 16
+
+        # 더 짧은 지연이 들어오면 그걸 우선
+        if delay_ms < int(getattr(self, "_roi_sync_delay", 16)):
+            self._roi_sync_delay = int(delay_ms)
+
+        if getattr(self, "_roi_sync_pending", False):
+            return
+
+        self._roi_sync_pending = True
+        QtCore.QTimer.singleShot(int(getattr(self, "_roi_sync_delay", 16)), self._roi_sync_flush)
+
+    def _roi_sync_flush(self):
+        self._roi_sync_pending = False
+        self._roi_sync_delay = 16
+        # 표시용 ROI만 다시 투영 후 overlay 동기화
+        self._recalc_roi_rect_from_src()
+        try:
+            self.roi_overlay.sync_to_video()
+        except Exception:
+            pass
+        # 드래그 중에는 UI(라벨/스핀) 갱신을 생략(끊김 방지)
+        if not getattr(self, "_roi_dragging", False):
+            try:
+                self._update_roi_ui()
+            except Exception:
+                pass
+
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+
+        # ROI overlay: hide when app deactivates so it never stays above other apps
+        if et == QtCore.QEvent.ApplicationDeactivate:
+            self._roi_overlay_app_inactive = True
+            try:
+                self.roi_overlay.hide()
+            except Exception:
+                pass
+            return False
+        if et == QtCore.QEvent.ApplicationActivate:
+            self._roi_overlay_app_inactive = False
+            # re-sync when coming back
+            self._roi_sync_request(0)
+            return False
+
+
+        # overlay sync (이벤트 기반)
+        if et in (QtCore.QEvent.Move, QtCore.QEvent.Resize, QtCore.QEvent.Show, QtCore.QEvent.WindowStateChange):
+            if obj is self or obj is self.video:
+                self._roi_sync_request(0)
+
+        # ✅ autoRepeat 차단: 이동 관련 키만(다른 단축키까지 막지 않게)
+        if et in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease) and event.isAutoRepeat():
+            k = event.key()
+            if k in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right, QtCore.Qt.Key_A, QtCore.Qt.Key_D):
+                return True
+            # 나머지는 통과
+            return False
+
+        if et == QtCore.QEvent.KeyPress:
+            key = event.key()            # ROI 생성 (I)
+            if key == QtCore.Qt.Key_I:
+                dlg = RoiCreateDialog(self)
+
+                # 소스 해상도에 맞춰 입력 상한을 설정(없으면 기본값 유지)
+                src_w, src_h = self._get_video_source_size()
+                if src_w > 0 and src_h > 0:
+                    try:
+                        dlg._w.setRange(10, int(src_w))
+                        dlg._h.setRange(10, int(src_h))
+                    except Exception:
+                        pass
+
+                # 기존 ROI가 있으면(src 기준) 크기만 다이얼로그에 반영
+                if getattr(self, "_roi_src_rect", None) is not None and not self._roi_src_rect.isNull():
+                    try:
+                        dlg._w.setValue(int(self._roi_src_rect.width()))
+                        dlg._h.setValue(int(self._roi_src_rect.height()))
+                    except Exception:
+                        pass
+                elif getattr(self, "_roi_rect", None):
+                    # fallback: widget ROI만 있을 때만 변환
+                    rr = self._roi_widget_to_source_rect(self._roi_rect)
+                    if not rr.isNull():
+                        try:
+                            dlg._w.setValue(int(rr.width()))
+                            dlg._h.setValue(int(rr.height()))
+                        except Exception:
+                            pass
+
+                if dlg.exec() == QtWidgets.QDialog.Accepted:
+                    req_w_src, req_h_src = dlg.get_size()
+
+                    src_w, src_h = self._get_video_source_size()
+                    if src_w <= 0 or src_h <= 0:
+                        # 소스 정보를 못 얻으면 기존 동작 유지(fallback: widget 기준)
+                        vw = int(self.video.width())
+                        vh = int(self.video.height())
+                        cx = max(0, (vw - req_w_src) // 2)
+                        cy = max(0, (vh - req_h_src) // 2)
+                        self._roi_src_rect = None
+                        self._roi_rect = QtCore.QRect(cx, cy, req_w_src, req_h_src)
+                        self._roi_drag = False
+                        self._roi_drag_last = None
+                        self._roi_dragging = False
+                        self.roi_overlay.sync_to_video()
+                        return True
+
+                    # 현재 뷰의 중앙을 src로 매핑해서 그 중심에 ROI(src)를 생성
+                    vw = max(1, int(self.video.width()))
+                    vh = max(1, int(self.video.height()))
+                    center_ui = QtCore.QPoint(vw // 2, vh // 2)
+                    center_src = self._widget_point_to_src_point(center_ui)
+                    if center_src is None:
+                        center_src = QtCore.QPoint(src_w // 2, src_h // 2)
+
+                    x = int(center_src.x() - int(req_w_src) // 2)
+                    y = int(center_src.y() - int(req_h_src) // 2)
+                    r = QtCore.QRect(int(x), int(y), int(req_w_src), int(req_h_src))
+                    r = self._clamp_src_rect_even(r) or self._clamp_src_rect(r)
+                    if r is None:
+                        self._roi_src_rect = None
+                        self._roi_rect = None
+                        self._roi_drag = False
+                        self._roi_drag_last = None
+                        self._roi_sync_request(0)
+                        return True
+
+                    self._roi_src_rect = r
+                    self._roi_drag = False
+                    self._roi_drag_last = None
+                    self._roi_sync_request(16)
+                return True
+
+
+            # ROI 삭제 (Del)
+            if key == QtCore.Qt.Key_Delete:
+                self._roi_src_rect = None
+                self._roi_rect = None
+                self._roi_drag = False
+                self._roi_drag_last = None
+                self._roi_sync_request(0)
+                self._update_roi_ui()
+                return True
+                self._roi_sync_request(0)
+                return True
+
+            # --- PSEUDO FULLSCREEN / 기타 키 바인딩 ---
+            if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                if getattr(self, "_pseudo_fs_on", False):
+                    self._exit_pseudo_fullscreen()
+                else:
+                    self._enter_pseudo_fullscreen()
+                return True
+
+            if key == QtCore.Qt.Key_Escape and getattr(self, "_pseudo_fs_on", False):
+                self._exit_pseudo_fullscreen()
+                return True
+
+            if key == QtCore.Qt.Key_Space:
+                self._toggle_pause_and_sync()
+                return True
+
+            if key == QtCore.Qt.Key_F4:
+                if self.color_dlg is None:
+                    self.color_dlg = ColorControlDialog(self.video, self)
+                else:
+                    self.color_dlg.sync_from_video()
+                self.color_dlg.show()
+                self.color_dlg.raise_()
+                self.color_dlg.activateWindow()
+                return True
+
+            if key == QtCore.Qt.Key_F5:
+                self.chk_loop.setChecked(not self.chk_loop.isChecked())
+                self._sync_ab_loop()
+                return True
+
+            if key in (QtCore.Qt.Key_BracketLeft, QtCore.Qt.Key_BracketRight):
+                t = self.video.time_pos()
+                if t is None:
+                    return True
+                if key == QtCore.Qt.Key_BracketLeft:
+                    self.loop_start = float(t)
+                else:
+                    self.loop_end = float(t)
+                self._update_loop_ui()
+                self.video.clear_ab_loop()
+                return True
+
+            if key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
+                if not self._nav_pressed:
+                    self._nav_pressed = True
+                    self._nav_dir = -1 if key == QtCore.Qt.Key_Left else 1
+                    self._nav_hold = False
+                    self._nav_step_once()
+                    self._nav_hold_timer.start()
+                return True
+
+            if key in (QtCore.Qt.Key_A, QtCore.Qt.Key_D):
+                if not self._fnav_pressed:
+                    self._fnav_pressed = True
+                    self._fnav_dir = -1 if key == QtCore.Qt.Key_A else 1
+                    self._fnav_hold = False
+                    self.video.clear_ab_loop()
+                    self._fnav_step_once()
+                    self._fnav_hold_timer.start()
+                return True
+
+        if et == QtCore.QEvent.KeyRelease:
+            if event.key() in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
+                self._stop_nav()
+                return True
+            if event.key() in (QtCore.Qt.Key_A, QtCore.Qt.Key_D):
+                self._stop_fnav()
+                return True
+
+        # ROI 드래그 이동 (video 위젯에서만)
+        # ROI는 src 기준으로 유지. 드래그 입력(widget 픽셀)을 src 이동량으로 환산해 src ROI를 이동한다.
+        if obj is self.video and getattr(self, "_roi_src_rect", None) and getattr(self, "_roi_rect", None):
+            if et == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
+                point = event.position().toPoint()
+                if self._roi_rect.contains(point):
+                    self._roi_drag = True
+                    self._roi_drag_last = point
+                    self._roi_dragging = True
+                    return True
+
+            if et == QtCore.QEvent.MouseMove and getattr(self, "_roi_drag", False):
+                point = event.position().toPoint()
+                last = getattr(self, "_roi_drag_last", None)
+                if last is None:
+                    self._roi_drag_last = point
+                    return True
+
+                dx_ui = int(point.x() - last.x())
+                dy_ui = int(point.y() - last.y())
+                self._roi_drag_last = point
+
+                # ROI가 검정 패딩(영상 외부)로 가지 않도록, widget 기준에서 먼저 clamp
+                vrect = self._get_video_rect_in_widget()
+                if vrect is not None and self._roi_rect is not None and not self._roi_rect.isNull():
+                    tentative = QtCore.QRect(self._roi_rect)
+                    tentative.translate(dx_ui, dy_ui)
+                    clamped = self._clamp_roi_rect_to_video_rect(tentative, vrect)
+                    dx_ui = int(clamped.x() - self._roi_rect.x())
+                    dy_ui = int(clamped.y() - self._roi_rect.y())
+
+                d = self._widget_delta_to_src_delta(dx_ui, dy_ui)
+                if d is None:
+                    return True
+                dsx, dsy = d
+
+                src = getattr(self, "_roi_src_rect", None)
+                if src is None or src.isNull():
+                    return True
+
+                moved = QtCore.QRect(int(src.x() + dsx), int(src.y() + dsy), int(src.width()), int(src.height()))
+                moved = self._clamp_src_rect_even(moved) or self._clamp_src_rect(moved)
+                if moved is None:
+                    return True
+
+                self._roi_src_rect = moved
+                self._roi_sync_request(16)
+                return True
+
+            if et == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.LeftButton:
+                if getattr(self, "_roi_drag", False):
+                    self._roi_drag = False
+                    self._roi_dragging = False
+                    self._roi_drag_last = None
+                    return True
+
+        return super().eventFilter(obj, event)
+
+    # [MOD] MainWindow._get_video_source_size
+    def _get_video_source_size(self) -> tuple[int, int]:
+        mpv_obj = getattr(self.video, "_mpv", None)
+        if mpv_obj:
+            try:
+                vp = mpv_obj["video-params"]  # dict-like (w,h,rotate 등)
+                w = int(vp.get("w") or 0)
+                h = int(vp.get("h") or 0)
+                if w > 0 and h > 0:
+                    return (w, h)
+            except Exception:
+                pass
+
+        # mpv에서 아직 video-params가 준비 안 된 경우(특히 pause/첫 프레임 전) ffprobe로 보강
+        path = getattr(self, "_current_path", None)
+        if path:
+            w, h = self._probe_video_source_size(path)
+            if w > 0 and h > 0:
+                return (w, h)
+
+        return (0, 0)
+
+
+    def _calc_display_video_rect_in_widget(self, src_w: int, src_h: int) -> QtCore.QRect:
+        vw = max(1, int(self.video.width()))
+        vh = max(1, int(self.video.height()))
+
+        if src_w <= 0 or src_h <= 0:
+            return QtCore.QRect(0, 0, vw, vh)
+
+        src_ar = float(src_w) / float(src_h)
+        wid_ar = float(vw) / float(vh)
+
+        if wid_ar > src_ar:
+            # 좌우 레터박스(필러박스)
+            disp_h = vh
+            disp_w = int(round(vh * src_ar))
+            x = (vw - disp_w) // 2
+            y = 0
+        else:
+            # 상하 레터박스
+            disp_w = vw
+            disp_h = int(round(vw / src_ar))
+            x = 0
+            y = (vh - disp_h) // 2
+
+        return QtCore.QRect(int(x), int(y), int(max(1, disp_w)), int(max(1, disp_h)))
+
+    def _roi_widget_to_source_rect(self, roi_widget: QtCore.QRect) -> QtCore.QRect:
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return QtCore.QRect()
+
+        W = max(1, int(self.video.width()))
+        H = max(1, int(self.video.height()))
+
+        z = float(getattr(self.video, "zoom_factor", 1.0))
+        px = float(getattr(self.video, "pan_x", 0.0))
+        py = float(getattr(self.video, "pan_y", 0.0))
+
+        base = min(W / float(src_w), H / float(src_h))
+        disp_w = float(src_w) * base * z
+        disp_h = float(src_h) * base * z
+
+        off_x = (float(W) - disp_w) * 0.5 - px * (disp_w - float(W)) * 0.5
+        off_y = (float(H) - disp_h) * 0.5 - py * (disp_h - float(H)) * 0.5
+
+        disp = QtCore.QRectF(off_x, off_y, disp_w, disp_h)
+        inter = QtCore.QRectF(roi_widget).intersected(disp)
+        if inter.isEmpty():
+            return QtCore.QRect()
+
+        scale = disp_w / float(src_w)
+
+        rx = inter.x() - disp.x()
+        ry = inter.y() - disp.y()
+
+        x = int(rx / scale)
+        y = int(ry / scale)
+        w = int(inter.width() / scale)
+        h = int(inter.height() / scale)
+
+        # 경계/최소 보정
+        x = max(0, min(x, src_w - 2))
+        y = max(0, min(y, src_h - 2))
+        w = max(2, min(w, src_w - x))
+        h = max(2, min(h, src_h - y))
+
+        # 짝수 보정(내림)
+        x = (x // 2) * 2
+        y = (y // 2) * 2
+        w = (w // 2) * 2
+        h = (h // 2) * 2
+
+        if x + w > src_w:
+            w = ((src_w - x) // 2) * 2
+        if y + h > src_h:
+            h = ((src_h - y) // 2) * 2
+
+        if w < 2 or h < 2:
+            return QtCore.QRect()
+
+        return QtCore.QRect(x, y, w, h)
+
+         
+
+    # =========================================================
+    # ROI (video_roi 방식): src 기준 유지 / 표시만 투영
+    # =========================================================
+    def _calc_view_params(self, src_w: int, src_h: int):
+        """현재 view(줌/팬/위젯크기)에서 src->widget 변환 파라미터를 일관되게 계산."""
+        W = max(1, int(self.video.width()))
+        H = max(1, int(self.video.height()))
+        z = float(getattr(self.video, "zoom_factor", 1.0))
+        px = float(getattr(self.video, "pan_x", 0.0))
+        py = float(getattr(self.video, "pan_y", 0.0))
+
+        base = min(W / float(src_w), H / float(src_h))
+        disp_w = float(src_w) * base * z
+        disp_h = float(src_h) * base * z
+
+        off_x = (float(W) - disp_w) * 0.5 - px * (disp_w - float(W)) * 0.5
+        off_y = (float(H) - disp_h) * 0.5 - py * (disp_h - float(H)) * 0.5
+
+        scale = disp_w / float(src_w)  # == disp_h/src_h
+        return off_x, off_y, scale, disp_w, disp_h
+
+
+    def _get_video_rect_in_widget(self) -> QtCore.QRectF | None:
+        """현재 view(줌/팬)에서 영상이 차지하는 widget 영역(QRectF)."""
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return None
+        off_x, off_y, _scale, disp_w, disp_h = self._calc_view_params(src_w, src_h)
+        return QtCore.QRectF(float(off_x), float(off_y), float(disp_w), float(disp_h))
+
+    def _clamp_roi_rect_to_video_rect(self, r: QtCore.QRect, vrect: QtCore.QRectF) -> QtCore.QRect:
+        """ROI 표시 rect(r)을 영상 표시 rect(vrect) 안으로 '이동만' clamp (크기 변경 금지)."""
+        if r is None or r.isNull():
+            return r
+
+        left = int(vrect.left())
+        top = int(vrect.top())
+        vw = int(vrect.width())
+        vh = int(vrect.height())
+        if vw <= 0 or vh <= 0:
+            return r
+
+        w = int(r.width())
+        h = int(r.height())
+        x = int(r.x())
+        y = int(r.y())
+
+        # ROI가 영상 표시영역보다 큰 경우: 크기는 유지하고 좌상단만 영상 안에 고정(더 이상 이동 불가)
+        if w > vw:
+            x = left
+        else:
+            max_x = left + vw - w
+            if x < left:
+                x = left
+            if x > max_x:
+                x = max_x
+
+        if h > vh:
+            y = top
+        else:
+            max_y = top + vh - h
+            if y < top:
+                y = top
+            if y > max_y:
+                y = max_y
+
+        return QtCore.QRect(int(x), int(y), int(w), int(h))
+
+    def _clamp_src_rect(self, r: QtCore.QRect) -> QtCore.QRect | None:
+        """src ROI를 영상 경계로 clamp (크기 유지, 위치만 조정)."""
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return None
+        x = int(r.x()); y = int(r.y()); w = int(r.width()); h = int(r.height())
+        w = max(2, w); h = max(2, h)
+
+        # ROI가 소스보다 큰 경우(이론상) 그때만 크기 제한
+        if w > src_w:
+            w = src_w
+        if h > src_h:
+            h = src_h
+        if w < 2 or h < 2:
+            return None
+
+        max_x = src_w - w
+        max_y = src_h - h
+        if max_x < 0: max_x = 0
+        if max_y < 0: max_y = 0
+
+        x = max(0, min(x, max_x))
+        y = max(0, min(y, max_y))
+        return QtCore.QRect(int(x), int(y), int(w), int(h))
+
+
+
+    def _clamp_src_rect_even(self, r: QtCore.QRect) -> QtCore.QRect | None:
+        """저장 직전 crop 규칙: (가능하면) 짝수 정렬. 크기는 유지하고 위치만 조정."""
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return None
+        x = int(r.x()); y = int(r.y()); w = int(r.width()); h = int(r.height())
+        w = max(2, w); h = max(2, h)
+
+        # 크기가 소스보다 큰 경우만 제한
+        if w > src_w:
+            w = src_w
+        if h > src_h:
+            h = src_h
+
+        def even_down(v: int) -> int:
+            return v & ~1
+
+        # 크기는 가능하면 유지(이미 짝수면 그대로). 홀수면 1px 내림.
+        w2 = max(2, even_down(w))
+        h2 = max(2, even_down(h))
+
+        # 위치는 짝수 정렬 후 경계 내로 clamp
+        x2 = even_down(x)
+        y2 = even_down(y)
+
+        max_x = src_w - w2
+        max_y = src_h - h2
+        if max_x < 0: max_x = 0
+        if max_y < 0: max_y = 0
+
+        x2 = max(0, min(x2, max_x))
+        y2 = max(0, min(y2, max_y))
+        return QtCore.QRect(int(x2), int(y2), int(w2), int(h2))
+
+
+
+    def _roi_source_to_widget_rect_floor(self, roi_src: QtCore.QRect) -> QtCore.QRect:
+        """src ROI를 widget 좌표로 투영(표시용). floor 기반으로 흔들림 최소화."""
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return QtCore.QRect()
+
+        off_x, off_y, scale, _, _ = self._calc_view_params(src_w, src_h)
+        x = off_x + float(roi_src.x()) * scale
+        y = off_y + float(roi_src.y()) * scale
+        w = float(roi_src.width()) * scale
+        h = float(roi_src.height()) * scale
+
+        xi = int(math.floor(x))
+        yi = int(math.floor(y))
+        wi = int(math.floor(w))
+        hi = int(math.floor(h))
+        if wi < 2 or hi < 2:
+            return QtCore.QRect()
+        return QtCore.QRect(xi, yi, wi, hi)
+
+    def _recalc_roi_rect_from_src(self):
+        """src ROI는 고정. view 변경(줌/팬/리사이즈) 시 표시용 ROI만 다시 계산."""
+        src = getattr(self, "_roi_src_rect", None)
+        if src is None or src.isNull():
+            self._roi_rect = None
+            return
+        wrect = self._roi_source_to_widget_rect_floor(src)
+        if wrect.isNull():
+            self._roi_rect = None
+            return
+        # 표시 rect가 레터박스(검정 패딩)로 삐져나가면 영상 표시 영역 안으로 clamp
+        vrect = self._get_video_rect_in_widget()
+        if vrect is not None:
+            wrect = self._clamp_roi_rect_to_video_rect(wrect, vrect)
+        self._roi_rect = wrect
+
+    def _widget_point_to_src_point(self, pt: QtCore.QPoint) -> QtCore.QPoint | None:
+        """widget 좌표(pt)를 src 좌표로 변환(줌/팬/레터박스 반영)."""
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return None
+
+        off_x, off_y, scale, disp_w, disp_h = self._calc_view_params(src_w, src_h)
+        if scale <= 0:
+            return None
+
+        x = float(pt.x())
+        y = float(pt.y())
+        left = off_x
+        top = off_y
+        right = off_x + disp_w
+        bottom = off_y + disp_h
+
+        # 표시 영역으로 clamp
+        if x < left: x = left
+        if x > right: x = right
+        if y < top: y = top
+        if y > bottom: y = bottom
+
+        sx = int(math.floor((x - off_x) / scale))
+        sy = int(math.floor((y - off_y) / scale))
+        sx = max(0, min(sx, src_w - 1))
+        sy = max(0, min(sy, src_h - 1))
+        return QtCore.QPoint(int(sx), int(sy))
+
+    def _widget_delta_to_src_delta(self, dx_ui: int, dy_ui: int) -> tuple[int, int] | None:
+        """widget 픽셀 이동량을 src 픽셀 이동량으로 환산."""
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return None
+        off_x, off_y, scale, _, _ = self._calc_view_params(src_w, src_h)
+        if scale <= 0:
+            return None
+        dsx = int(round(float(dx_ui) / scale))
+        dsy = int(round(float(dy_ui) / scale))
+        return int(dsx), int(dsy)
+
+
+    def _recenter_view_to_roi_center(self):
+        """줌 변경 시 ROI 중심이 항상 화면 중심에 오도록 pan을 자동 조정."""
+        roi = getattr(self, "_roi_src_rect", None)
+        if roi is None or roi.isNull():
+            return
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return
+
+        # 현재 view 파라미터 (disp_w/disp_h는 pan과 무관)
+        off_x, off_y, scale, disp_w, disp_h = self._calc_view_params(src_w, src_h)
+        W = max(1, int(self.video.width()))
+        H = max(1, int(self.video.height()))
+
+        cx = float(roi.center().x())
+        cy = float(roi.center().y())
+
+        # 원하는 off (ROI 중심 -> 화면 중심)
+        want_off_x = (float(W) * 0.5) - (cx * float(scale))
+        want_off_y = (float(H) * 0.5) - (cy * float(scale))
+
+        # off_x = (W-disp_w)/2 - pan_x*(disp_w-W)/2  (기존 모델 유지)
+        A_x = (float(W) - float(disp_w)) * 0.5
+        B_x = (float(disp_w) - float(W)) * 0.5
+        if abs(B_x) > 1e-6:
+            pan_x = (A_x - want_off_x) / B_x
+        else:
+            pan_x = float(getattr(self.video, "pan_x", 0.0))
+
+        A_y = (float(H) - float(disp_h)) * 0.5
+        B_y = (float(disp_h) - float(H)) * 0.5
+        if abs(B_y) > 1e-6:
+            pan_y = (A_y - want_off_y) / B_y
+        else:
+            pan_y = float(getattr(self.video, "pan_y", 0.0))
+
+        # pan 범위 제한 (기존 UX 보호)
+        pan_x = max(-1.0, min(1.0, float(pan_x)))
+        pan_y = max(-1.0, min(1.0, float(pan_y)))
+
+        # 실제 적용 (video 위젯과 mpv 둘 다)
+        try:
+            self.video.pan_x = float(pan_x)
+            self.video.pan_y = float(pan_y)
+        except Exception:
+            pass
+        try:
+            # mpv는 video-pan-x/y를 사용
+            if hasattr(self.video, "_mpv") and self.video._mpv is not None:
+                self.video._mpv["video-pan-x"] = float(pan_x)
+                self.video._mpv["video-pan-y"] = float(pan_y)
+        except Exception:
+            pass
+
+    # --- 나머지 메서드 ---
+    def _on_nav_hold_start(self):
+        if not self._nav_pressed: return
+        self._nav_hold = True
+        self._nav_repeat_timer.start()
+
+    def _on_nav_repeat(self):
+        if not self._nav_pressed or not self._nav_hold: return
+        self._nav_step_once()
+
+    def _nav_step_once(self):
+        if self._nav_dir < 0: self.video.step_time_left()
+        else: self.video.step_time_right()
+
+    def _stop_nav(self):
+        self._nav_pressed = False
+        self._nav_hold = False
+        self._nav_dir = 0
+        self._nav_hold_timer.stop()
+        self._nav_repeat_timer.stop()
+
+    def _on_fnav_hold_start(self):
+        if not self._fnav_pressed: return
+        self._fnav_hold = True
+        self._fnav_repeat_timer.start()
+
+    def _on_fnav_repeat(self):
+        if not self._fnav_pressed or not self._fnav_hold: return
+        self._fnav_step_once()
+
+    def _fnav_step_once(self):
+        if self._fnav_dir < 0: self.video.step_frame_left()
+        else: self.video.step_frame_right()
+
+    def _stop_fnav(self):
+        self._fnav_pressed = False
+        self._fnav_hold = False
+        self._fnav_dir = 0
+        self._fnav_hold_timer.stop()
+        self._fnav_repeat_timer.stop()
+
+    def _reset_loop_points(self):
+        self.loop_start = None
+        self.loop_end = None
+        self._update_loop_ui()
+        self.video.clear_ab_loop()
+
+    def _update_loop_ui(self):
+        self.lbl_zoom.setText(f"Zoom: {float(self._last_zoom):.2f}x")
+        self.lbl_loop_range.setText(f"({fmt_time(self.loop_start)} / {fmt_time(self.loop_end)})")
+        self._update_roi_ui()
+
+    def _on_zoom_changed(self, z: float):
+        self._last_zoom = float(z)
+        self._update_loop_ui()
+        # 줌/팬 변경 시 ROI는 src 기준으로 고정, 표시만 다시 투영
+        self._roi_sync_request(16)
+
+
+    def _toggle_pause_and_sync(self):
+        self._stop_nav(); self._stop_fnav()
+        was_paused = self.video.is_paused()
+        if was_paused:
+            d = self.video.duration()
+            pos = self.video.time_pos()
+            eps = 0.05
+            eof_like = self.video.eof_reached() or (d and pos is None) or (d and pos is not None and float(pos) >= float(d) - eps)
+            if eof_like:
+                loop_ok = (
+                    self.chk_loop.isChecked()
+                    and (self.loop_start is not None)
+                    and (self.loop_end is not None)
+                    and (float(self.loop_start) <= float(self.loop_end))
+                )
+                if loop_ok: self.video.seek(float(self.loop_start))
+                else: self.video.seek(0.0)
+        self.video.toggle_pause()
+        if was_paused and not self.video.is_paused():
+            self._sync_ab_loop()
+
+    def _clear_ab_loop_if_needed(self):
+        if self._ab_last is None:
+            return
+        self.video.clear_ab_loop()
+        self._ab_last = None
+
+    def _sync_ab_loop(self):
+        if not self.chk_loop.isChecked():
+            self._clear_ab_loop_if_needed()
+            return
+
+        if self.loop_start is None or self.loop_end is None:
+            self._clear_ab_loop_if_needed()
+            return
+
+        start = float(self.loop_start)
+        end = float(self.loop_end)
+
+        if start > end:
+            self._clear_ab_loop_if_needed()
+            return
+
+        if self.video.is_paused() or getattr(self, "_fnav_pressed", False) or getattr(self, "_fnav_hold", False):
+            self._clear_ab_loop_if_needed()
+            return
+
+        d = self.video.duration()
+        pos = self.video.time_pos()
+        if not d or pos is None:
+            self._clear_ab_loop_if_needed()
+            return
+
+        eps = 0.05
+        if self.video.eof_reached() or float(pos) >= float(d) - eps:
+            self._clear_ab_loop_if_needed()
+            return
+
+        if pos < start or pos > end:
+            self.video.seek_abs(start)
+
+        if self._ab_last != (start, end):
+            self.video.set_ab_loop(start, end)
+            self._ab_last = (start, end)
+
+    def _enter_pseudo_fullscreen(self):
+        if getattr(self, "_pseudo_fs_on", False):
+            return
+
+        screen = None
+        wh = self.windowHandle()
+        if wh and wh.screen():
+            screen = wh.screen()
+        else:
+            screen = QtWidgets.QApplication.screenAt(self.mapToGlobal(QtCore.QPoint(10, 10)))
+
+        central = self.centralWidget()
+        root = central.layout()
+
+        self._pseudo_saved = {
+            "flags": self.windowFlags(),
+            "geom": self.saveGeometry(),
+            "margins": root.contentsMargins(),
+            "spacing": root.spacing(),
+            "vis": {},
+        }
+        for w in central.findChildren(QtWidgets.QWidget):
+            if w is central or w is self.video:
+                continue
+            self._pseudo_saved["vis"][w] = w.isVisible()
+            w.hide()
+
+        # ✅ overlay 강제 숨김(동기화에서 다시 켜지지 않게 suspend 플래그)
+        self._roi_overlay_suspended = True
+        self.roi_overlay.hide()
+
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.setWindowFlags(self._pseudo_saved["flags"] | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+        self.show()
+
+        if screen is not None:
+            r = screen.geometry()
+            r.adjust(-1, -1, 1, 2)
+            self.setGeometry(r)
+
+        self._pseudo_fs_on = True
+        self.activateWindow()
+        self.raise_()
+        self.video.setFocus()
+
+    def _exit_pseudo_fullscreen(self):
+        if not getattr(self, "_pseudo_fs_on", False):
+            return
+
+        saved = self._pseudo_saved
+        central = self.centralWidget()
+        root = central.layout()
+
+        self.setWindowFlags(saved["flags"])
+        self.showNormal()
+        self.show()
+
+        m = saved["margins"]
+        root.setContentsMargins(m.left(), m.top(), m.right(), m.bottom())
+        root.setSpacing(saved["spacing"])
+        self._pseudo_fs_on = False
+
+        geom_bytes = saved.get("geom", None)
+
+        def _restore_late():
+            if geom_bytes:
+                self.restoreGeometry(geom_bytes)
+            vis = saved.get("vis", {})
+            for w, was_visible in vis.items():
+                if was_visible: w.show()
+                else: w.hide()
+            self.activateWindow()
+            self.raise_()
+            self.video.setFocus()
+
+            # ✅ overlay 복구
+            self._roi_overlay_suspended = False
+            self._roi_sync_request(0)
+
+        QtCore.QTimer.singleShot(0, _restore_late)
+
+    def _sync_roi_overlay(self):
+        if not hasattr(self, "_roi_overlay"):
+            return
+        if not self.video:
+            return
+
+        top_left = self.video.mapToGlobal(QtCore.QPoint(0, 0))
+        self._roi_overlay.setGeometry(
+            QtCore.QRect(top_left, self.video.size())
+        )
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._sync_roi_overlay()
+
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._sync_roi_overlay()
+
+    def _crop_by_roi(self):
+        if not getattr(self, "_current_path", None):
+            QtWidgets.QMessageBox.warning(self, "저장", "먼저 파일을 열어 주세요.")
+            return
+
+        if not getattr(self, "_roi_rect", None):
+            QtWidgets.QMessageBox.warning(self, "저장", "ROI를 먼저 생성해 주세요.")
+            return
+
+        crop = self._roi_to_source_crop()
+        if not crop:
+            QtWidgets.QMessageBox.warning(self, "저장", "ROI가 영상 영역 밖입니다.")
+            return
+
+        x, y, w, h = crop
+        if w <= 0 or h <= 0:
+            QtWidgets.QMessageBox.warning(self, "저장", "ROI 크기가 유효하지 않습니다.")
+            return
+
+        # 시간 구간 규칙:
+        # - 시작/종료 둘 다 없으면: 전체 저장
+        # - 둘 중 하나만 있으면: 저장 금지
+        # - 시작 > 종료면: 저장 금지
+        start = getattr(self, "loop_start", None)
+        end = getattr(self, "loop_end", None)
+
+        if (start is None) != (end is None):
+            QtWidgets.QMessageBox.warning(self, "저장", "시작/종료 시간이 모두 있어야 저장됩니다. ([ ] 둘 다 지정)")
+            return
+
+        if start is not None and end is not None and float(start) > float(end):
+            QtWidgets.QMessageBox.warning(self, "저장", "종료 시간이 시작 시간보다 빠릅니다.")
+            return
+
+        in_path = self._current_path
+        base, ext = os.path.splitext(in_path)
+
+        # 파일명에 ROI + 구간(있으면) 포함
+        if start is None:
+            out_path = f"{base}_roi_{x}_{y}_{w}x{h}{ext}"
+        else:
+            out_path = f"{base}_roi_{x}_{y}_{w}x{h}_{float(start):.3f}-{float(end):.3f}{ext}"
+
+        QtWidgets.QMessageBox.information(
+            self, "저장",
+            "저장을 시작했습니다.\n완료까지 잠시 기다려 주세요."
+        )
+
+        crop_expr = f"crop={int(w)}:{int(h)}:{int(x)}:{int(y)}"
+
+        cmd = ["ffmpeg", "-y"]
+        # 구간 있으면 적용
+        if start is not None and end is not None:
+            cmd += ["-ss", f"{float(start):.6f}", "-to", f"{float(end):.6f}"]
+
+        cmd += [
+            "-i", in_path,
+            "-vf", crop_expr,
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+            "-c:a", "copy",
+            out_path
+        ]
+
+        try:
+            subprocess.run(cmd, check=True)
+            QtWidgets.QMessageBox.information(self, "완료", f"저장 완료\n{out_path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "실패", f"저장 실패\n{e}")
+
+
+
+    def _roi_to_source_crop(self):
+        src = getattr(self, "_roi_src_rect", None)
+        if src is not None and not src.isNull():
+            r2 = self._clamp_src_rect_even(src)
+            if r2 is None:
+                return None
+            return int(r2.x()), int(r2.y()), int(r2.width()), int(r2.height())
+
+        r = getattr(self, "_roi_rect", None)
+        if r is None or r.isNull():
+            return None
+        rr = self._roi_widget_to_source_rect(r)
+        if rr.isNull():
+            return None
+        r2 = self._clamp_src_rect_even(rr)
+        if r2 is None:
+            return None
+        return int(r2.x()), int(r2.y()), int(r2.width()), int(r2.height())
+
+    def _get_src_wh(self) -> tuple[int | None, int | None]:
+        mpv_inst = getattr(self.video, "_mpv", None)
+        if mpv_inst is None:
+            return None, None
+        try:
+            vp = mpv_inst.video_params  # dict
+            w = int(vp.get("w") or 0)
+            h = int(vp.get("h") or 0)
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
+        return None, None
+
+    def _roi_widget_to_src_crop(self) -> tuple[int, int, int, int] | None:
+        r = getattr(self, "_roi_rect", None)
+        if not r:
+            return None
+
+        src_w, src_h = self._get_src_wh()
+        if not src_w or not src_h:
+            return None
+
+        W = max(1, int(self.video.width()))
+        H = max(1, int(self.video.height()))
+
+        # 현재 화면 표시 스케일(레터박스 포함) + 줌 반영
+        zoom = float(getattr(self, "_last_zoom", 1.0))
+        base = min(W / float(src_w), H / float(src_h))
+        scale = max(1e-9, base * zoom)
+
+        disp_w = float(src_w) * scale
+        disp_h = float(src_h) * scale
+        off_x = (float(W) - disp_w) * 0.5
+        off_y = (float(H) - disp_h) * 0.5
+
+        # 위젯좌표 -> 원본좌표
+        x = int(round((float(r.x()) - off_x) / scale))
+        y = int(round((float(r.y()) - off_y) / scale))
+        w = int(round(float(r.width()) / scale))
+        h = int(round(float(r.height()) / scale))
+
+        # clamp
+        x = max(0, min(x, src_w - 2))
+        y = max(0, min(y, src_h - 2))
+        w = max(2, min(w, src_w - x))
+        h = max(2, min(h, src_h - y))
+
+        # 홀수 -> 짝수 보정(사용자 허용 조건)
+        x -= (x % 2)
+        y -= (y % 2)
+        w -= (w % 2)
+        h -= (h % 2)
+        w = max(2, w)
+        h = max(2, h)
+
+        # 최종 clamp(짝수 보정 후)
+        x = max(0, min(x, src_w - w))
+        y = max(0, min(y, src_h - h))
+
+        return x, y, w, h
+
+    # [ADD] MainWindow._probe_video_source_size
+    def _probe_video_source_size(self, path: str) -> tuple[int, int]:
+        if not path:
+            return (0, 0)
+
+        try:
+            # ffprobe 결과 예: "3840x2160"
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                path
+            ]
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore").strip()
+            if "x" in out:
+                w_str, h_str = out.split("x", 1)
+                w = int(w_str.strip())
+                h = int(h_str.strip())
+                if w > 0 and h > 0:
+                    return (w, h)
+        except Exception:
+            pass
+
+        return (0, 0)
+
+    def _update_roi_widget_rect_from_source(self):
+        src = getattr(self, "_roi_src_rect", None)
+        if src is None or src.isNull():
+            return
+        self._roi_rect = self._roi_source_to_widget_rect_floor(src)
+
+    def _roi_source_to_widget_rect(self, roi_src: QtCore.QRect) -> QtCore.QRect:
+        src_w, src_h = self._get_video_source_size()
+        if src_w <= 0 or src_h <= 0:
+            return QtCore.QRect()
+
+        W = max(1, int(self.video.width()))
+        H = max(1, int(self.video.height()))
+
+        z = float(getattr(self.video, "zoom_factor", 1.0))
+        px = float(getattr(self.video, "pan_x", 0.0))
+        py = float(getattr(self.video, "pan_y", 0.0))
+
+        base = min(W / float(src_w), H / float(src_h))
+        disp_w = float(src_w) * base * z
+        disp_h = float(src_h) * base * z
+
+        off_x = (float(W) - disp_w) * 0.5 - px * (disp_w - float(W)) * 0.5
+        off_y = (float(H) - disp_h) * 0.5 - py * (disp_h - float(H)) * 0.5
+
+        scale = disp_w / float(src_w)  # == disp_h/src_h
+
+        x = off_x + float(roi_src.x()) * scale
+        y = off_y + float(roi_src.y()) * scale
+        w = float(roi_src.width()) * scale
+        h = float(roi_src.height()) * scale
+
+        return QtCore.QRect(int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+
+    def _update_roi_ui(self):
+        if not hasattr(self, "lbl_roi"):
+            return
+
+        crop = self._roi_to_source_crop()
+        if not crop:
+            self.lbl_roi.setText("ROI: -- x --")
+            return
+
+        x, y, w, h = crop
+        self.lbl_roi.setText(f"ROI: {int(w)} x {int(h)}  ({int(x)},{int(y)})")
+
+    def _get_display_rect(self, vw: int, vh: int, src_w: int, src_h: int) -> QtCore.QRectF:
+        """
+        video 위젯(vw,vh) 안에서 실제 영상이 그려지는 사각형(레터박스+줌+팬 반영).
+        반환: QRectF(x, y, w, h)  (video 위젯 좌표계)
+        """
+        if vw <= 0 or vh <= 0 or src_w <= 0 or src_h <= 0:
+            return QtCore.QRectF()
+
+        z = float(getattr(self.video, "zoom_factor", 1.0))
+        px = float(getattr(self.video, "pan_x", 0.0))
+        py = float(getattr(self.video, "pan_y", 0.0))
+
+        base = min(float(vw) / float(src_w), float(vh) / float(src_h))
+        disp_w = float(src_w) * base * z
+        disp_h = float(src_h) * base * z
+
+        # 중앙 기준 + pan(정규화)
+        # pan은 화면 반폭/반높이 기준으로 이동하는 형태로 취급
+        left = (float(vw) - disp_w) * 0.5 + px * (float(vw) * 0.5)
+        top  = (float(vh) - disp_h) * 0.5 + py * (float(vh) * 0.5)
+
+        return QtCore.QRectF(left, top, disp_w, disp_h)
+
+    def _on_roi_save_clicked(self):
+        # 기존 자르기 로직 그대로 사용(시간 범위 규칙 포함)
+        self._crop_by_roi()
+
+    def _on_loop_reset_clicked(self):
+        # 기존 루프 초기화 로직 그대로 사용
+        self._reset_loop_points()
+        self._update_loop_ui()
+
+    def toggle_pause(self):
+        # 기존 구현(_toggle_pause_and_sync)로 위임: 예전 연결을 살리기 위한 호환 함수
+        self._toggle_pause_and_sync()
+
+    def stop(self):
+        # 기존 video stop 로직으로 위임 (호환용)
+        self.video.stop()
+    
+
+def toggle_pause(self):
+    # 기존 구현 우선 사용
+    if hasattr(self, "_toggle_pause_and_sync"):
+        return self._toggle_pause_and_sync()
+    # 최후 fallback
+    if hasattr(self, "video") and hasattr(self.video, "toggle_pause"):
+        return self.video.toggle_pause()
+
+
+def stop(self):
+    if hasattr(self, "video") and hasattr(self.video, "stop"):
+        return self.video.stop()
+
+def on_volume_changed(self, v):
+    # 일반적으로 slider 0~100 가정
+    try:
+        vv = float(v) / 100.0
+    except Exception:
+        vv = 0.0
+
+    if hasattr(self, "video") and hasattr(self.video, "set_volume"):
+        return self.video.set_volume(vv)
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
